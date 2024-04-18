@@ -1,7 +1,5 @@
-# For detailed documentation visit: https://www.rudderstack.com/docs/profiles/overview/
-
 models:
-  - name: user_id_stitcher
+  - name: rudder_user_id_stitcher
     model_type: id_stitcher
     model_spec:
       validity_time: 24h # 1 day
@@ -9,35 +7,331 @@ models:
       edge_sources:
         - from: inputs/rsIdentifies
         - from: inputs/rsTracks
-  - name: user_profile #name of profiles view that will be created in your warehouse
-    #view is created after (pb run) at the location specified during (pb init connection)
+        - from: inputs/rsPages
+          # Remove the section below, if you don't want to generate a feature table
+  - name: rudder_user_base_features
     model_type: feature_table_model
     model_spec:
       validity_time: 24h # 1 day
       entity_key: user
+      macros:
+        - name: macro_datediff
+          inputs:
+            - column
+          value: "{% if !(end_time|isnil) %} datediff(day, date({{column}}), date('{{end_time.Format(\"2006-01-02 15:04:05\")}}')) {% else %} datediff(day, date({{column}}::timestamp), GETDATE()) {% endif %}"
+        - name: macro_datediff_n
+          inputs:
+            - column
+            - number_of_days
+          value: "{% if !(end_time|isnil) %} datediff(day, date({{column}}), date('{{end_time.Format(\"2006-01-02 15:04:05\")}}')) <={{number_of_days}} {% else %} datediff(day, date({{column}}), GETDATE()) <= {{number_of_days}} {% endif %}"
+      vars:
+        - entity_var:
+            name: max_timestamp_bw_tracks_pages
+            select: max(timestamp)
+            from: models/rsTracksUnionPages
+        #days since last seen
+        - entity_var:
+            name: days_since_last_seen
+            select: "{{macro_datediff('max_timestamp_bw_tracks_pages')}}"
+            dependencies:
+              - max_timestamp_bw_tracks_pages
+        #Churn features
+        - entity_var:
+            name: is_churned_7_days
+            select: case when days_since_last_seen > 7 then 1 else 0 end
+            description: Depending on the n value, it specifies if there is any activity observed in the last 7 days.
+            dependencies:
+              - days_since_last_seen
+        - entity_var:
+            name: days_since_account_creation
+            select: "{{macro_datediff('min(timestamp)')}}"
+            from: inputs/rsIdentifies
+        - entity_var:
+            name: state
+            from: inputs/rsIdentifies
+            select: first_value(state)
+            window:
+              order_by:
+                - timestamp desc
+            where: state is not null and state!=''
+        - entity_var:
+            name: country
+            from: inputs/rsIdentifies
+            select: first_value(address_country)
+            window:
+              order_by:
+                - timestamp desc
+            where: address_country is not null and address_country!=''
+        - entity_var:
+            name: first_name
+            from: inputs/rsIdentifies
+            select: first_value(first_name)
+            window:
+              order_by:
+                - timestamp desc
+            where: first_name is not null and first_name!=''
+        - entity_var:
+            name: last_name
+            from: inputs/rsIdentifies
+            select: first_value(last_name)
+            window:
+              order_by:
+                - timestamp desc
+            where: last_name is not null and last_name!=''
+        - entity_var:
+            name: currency
+            from: inputs/rsIdentifies
+            select: first_value(currency)
+            window:
+              order_by:
+                - timestamp desc
+            where: currency is not null and currency!=''
+        - entity_var:
+            name: campaign_sources
+            select: array_agg( context_campaign_source )
+            from: inputs/rsIdentifies
+        - entity_var:
+            name: active_days_in_past_7_days
+            select: count(distinct date(timestamp))
+            from: models/rsTracksUnionPages
+            where: "{{macro_datediff_n('timestamp','7')}}"
+            description: Out of 7 days, how many days have recorded an event till date including today
+        - entity_var:
+            name: active_days_in_past_365_days
+            select: count(distinct date(timestamp))
+            from: models/rsTracksUnionPages
+            where: "{{macro_datediff_n('timestamp','365')}}"
+            description: Out of 365 days, how many days have recorded an event till date including today
+        - input_var:
+            name: session_start_time
+            from: models/rsTracksUnionPages
+            select: min(timestamp)
+            window:
+              partition_by:
+                - context_session_id
+                - rudder_id
+            description: Describes the start time of session of a specific context_id
+        - input_var:
+            name: session_end_time
+            from: models/rsTracksUnionPages
+            select: max(timestamp)
+            window:
+              partition_by:
+                - context_session_id
+                - rudder_id
+            description: Describes the end time of session of a specific context_id
+        - input_var:
+            name: session_row_number
+            from: models/rsTracksUnionPages
+            select: row_number()
+            window:
+              partition_by:
+                - context_session_id
+                - rudder_id
+              order_by:
+                - timestamp desc
+            description: A row number for all the events within a single session. This is used to compute some of the session based features/
+        - entity_var:
+            name: total_sessions_till_date
+            from: models/rsTracksUnionPages
+            select: count(distinct context_session_id)
+            where: context_session_id is not null
+            description: Total individual sessions created till date.
+        - entity_var:
+            name: total_sessions_last_week
+            from: models/rsTracksUnionPages
+            select: count(distinct context_session_id)
+            where: " context_session_id is not null and {{macro_datediff('session_start_time')}} between 0 and 7"
+            description: total number of sessions over last 7 days.
+        - entity_var:
+            name: total_sessions_90_days
+            from: models/rsTracksUnionPages
+            select: count(distinct context_session_id)
+            where: " context_session_id is not null and {{macro_datediff('session_start_time')}} between 0 and 90"
+            description: total number of sessions over last 90 days.
+        - entity_var:
+            name: total_sessions_365_days
+            from: models/rsTracksUnionPages
+            select: count(distinct context_session_id)
+            where: " context_session_id is not null and {{macro_datediff('session_start_time')}} between 0 and 365 "
+            description: total number of sessions over last 356 days.
+        - entity_var:
+            name: avg_session_length_in_sec_overall
+            from: models/rsTracksUnionPages
+            select: avg(datediff(second, session_start_time, session_end_time))
+            where: session_row_number = 1 and context_session_id is not null
+            description: Average session length (in seconds) of all the user sessions till date.
+        - entity_var:
+            name: avg_session_length_in_sec_last_week
+            from: models/rsTracksUnionPages
+            select: avg(datediff(second, session_start_time, session_end_time))
+            where: context_session_id is not null and session_row_number = 1 and {{macro_datediff('session_start_time')}}  between 0 and 7
+            description: Average session length (in seconds) of all the user sessions that started in last 7 days
+        - entity_var:
+            name: avg_session_length_in_sec_365_days
+            from: models/rsTracksUnionPages
+            select: avg(datediff(second, session_start_time, session_end_time))
+            where: "context_session_id is not null and session_row_number = 1 and {{macro_datediff_n('session_start_time','365')}}"
+            description: Average session length (in seconds) of all the user sessions that started in last 365 days
+        - entity_var:
+            name: first_seen_date
+            from: models/rsTracksUnionPages
+            select: min(date(session_start_time))
+            description: The first date on which an event has been recorded by the user
+        - entity_var:
+            name: last_seen_date
+            from: models/rsTracksUnionPages
+            select: max(date(session_end_time))
+            description: The latest date on which an event has been recorded by the user
+        - entity_var:
+            name: first_campaign_name
+            from: inputs/rsPages
+            select: first_value(context_campaign_name)
+            window:
+              order_by:
+                - timestamp asc
+            where: context_campaign_name is not null and context_campaign_name!=''
+            description: First campaign from which a user has visited the app
+        - entity_var:
+            name: last_campaign_name
+            from: inputs/rsPages
+            select: last_value(context_campaign_name)
+            window:
+              order_by:
+                - timestamp asc
+            where: context_campaign_name is not null and context_campaign_name!=''
+            description: Latest campaign from which a user has visited the app
+        - entity_var:
+            name: first_source_name
+            from: inputs/rsPages
+            select: first_value(context_campaign_source)
+            window:
+              order_by:
+                - timestamp asc
+            where: context_campaign_source is not null and context_campaign_source!=''
+            description: First source from which a user has visited the app
+        - entity_var:
+            name: last_source_name
+            from: inputs/rsPages
+            select: last_value(context_campaign_source)
+            window:
+              order_by:
+                - timestamp asc
+            where: context_campaign_source is not null and context_campaign_source!=''
+            description: Last source from which a user has visited the app
+        - entity_var:
+            name: campaigns_list
+            from: inputs/rsPages
+            select: array_agg( context_campaign_name) WITHIN GROUP (ORDER BY timestamp asc)
+            description: list of all campaigns from which a user has visited the app, sorted in chronological order, from oldest to newest
+        - entity_var:
+            name: mediums_list
+            from: inputs/rsPages
+            select: array_agg( context_campaign_medium) WITHIN GROUP (ORDER BY timestamp asc)
+            description: list of all mediums from which a user has visited the app, sorted in chronological order, from oldest to newest
+        - entity_var:
+            name: sources_list
+            from: inputs/rsPages
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: list of all sources from which a user has visited the app, sorted in chronological order, from oldest to newest
+        - entity_var:
+            name: HolidayPackage
+            from: inputs/rsPages
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Holiday special
+        - entity_var:
+            name: content_count
+            from: inputs/rsTracks
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: how many knowledge content did they consume
+        - entity_var:
+            name: TripCount
+            from: inputs/rsTracks
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: How many flights did the customer take
+        - entity_var:
+            name: HotelPartner
+            from: inputs/rsPages
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Corporate Partners
+        - entity_var:
+            name: BladeAirportPass
+            from: inputs/rsIdentifies
+            select: array_agg( AirportPass) WITHIN GROUP (ORDER BY timestamp asc)
+            description: User member of airport pass boolean
+        - entity_var:
+            name: MostFrequentDestination
+            from: inputs/rsTracks
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Most frequent city of use
+        - entity_var:
+            name: HomeCity
+            from: inputs/rsIdentifies
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Where is the users base city
+        - entity_var:
+            name: CorporateTravelCustomer
+            from: inputs/rsIdentifies
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Is the user a B2B customer
+        - entity_var:
+            name: LastCheckoutEvent
+            from: inputs/rsTracks
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Did the user churn from checkout
+        - entity_var:
+            name: LastTrip
+            from: inputs/rsTracks
+            select: array_agg( executeRide) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Last flight user took
+        - entity_var:
+            name: CustomerAcquisitionCost
+            from: inputs/rsTracks
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Internal Churn Calculation
+        - entity_var:
+            name: ChurnRating
+            from: inputs/rsPages
+            select: array_agg( context_campaign_source) WITHIN GROUP (ORDER BY timestamp asc)
+            description: Internal Churn Calculation
       features:
-        - first_seen
-        - user_lifespan
-        - days_active
-var_groups:
-  - name: user_vars
-    entity_key: user
-    vars:
-      - entity_var:
-          name: first_seen
-          select: min({{rsTracks.Var("timestamp::date")}})
-          from: inputs/rsTracks
-      - entity_var:
-          name: last_seen
-          select: max({{rsTracks.Var("timestamp::date")}})
-          from: inputs/rsTracks
-          is_feature: false
-      - entity_var:
-          name: user_lifespan
-          select: '{{user.Var("last_seen")}} - {{user.Var("first_seen")}}'
-          description: Life Time Value of a customer
-      - entity_var:
-          name: days_active
-          select: count( distinct {{rsTracks.Var("timestamp::date")}})
-          from: inputs/rsTracks
-          description: No. of days a customer was active
+        - days_since_last_seen
+        - days_since_account_creation
+        - state
+        - country
+        - first_name
+        - last_name
+        - currency
+        - campaign_sources
+        - active_days_in_past_7_days
+        - active_days_in_past_365_days
+        - total_sessions_till_date
+        - total_sessions_last_week
+        - total_sessions_90_days
+        - total_sessions_365_days
+        - avg_session_length_in_sec_overall
+        - avg_session_length_in_sec_last_week
+        - avg_session_length_in_sec_365_days
+        - first_seen_date
+        - last_seen_date
+        - is_churned_7_days
+        - first_campaign_name
+        - last_campaign_name
+        - first_source_name
+        - last_source_name
+        - campaigns_list
+        - mediums_list
+        - sources_list
+        - HolidayPackage
+        - content_count
+        - TripCount
+        - HotelPartner
+        - BladeAirportPass
+        - MostFrequentDestination
+        - HomeCity
+        - CorporateTravelCustomer
+        - LastCheckoutEvent
+        - LastTrip
+        - CustomerAcquisitionCost
+        - ChurnRating
+
